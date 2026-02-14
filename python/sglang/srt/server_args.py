@@ -420,6 +420,9 @@ class ServerArgs:
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
+    # Helix parallelism (KV parallelism for long-context decoding)
+    helix_kvp_size: int = 1
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -750,6 +753,9 @@ class ServerArgs:
 
         # Handle context parallelism.
         self._handle_context_parallelism()
+
+        # Handle Helix parallelism.
+        self._handle_helix_parallelism()
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
@@ -2074,6 +2080,24 @@ class ServerArgs:
                     self.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
 
+    def _handle_helix_parallelism(self):
+        if self.helix_kvp_size > 1:
+            assert (
+                self.tp_size % self.helix_kvp_size == 0
+            ), f"tp_size ({self.tp_size}) must be divisible by helix_kvp_size ({self.helix_kvp_size})"
+            helix_tpa_size = self.tp_size // self.helix_kvp_size
+            assert helix_tpa_size >= 1, (
+                f"helix TPA size (tp_size/kvp_size = {helix_tpa_size}) must be >= 1"
+            )
+            assert self.pp_size == 1, "PP is not supported with Helix parallelism"
+            assert self.attn_cp_size == 1, (
+                "Context parallelism (attn_cp_size) is not supported with Helix parallelism"
+            )
+            logger.info(
+                f"Helix parallelism enabled: KVP={self.helix_kvp_size}, "
+                f"TPA={helix_tpa_size}, TPF={self.tp_size}"
+            )
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -3286,6 +3310,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
+        )
+        parser.add_argument(
+            "--helix-kvp-size",
+            type=int,
+            default=ServerArgs.helix_kvp_size,
+            help="Helix KV parallelism size. Shards KV cache across this many GPU groups "
+            "along the sequence dimension for long-context decoding. Default 1 (disabled). "
+            "tp_size must be divisible by helix_kvp_size.",
         )
         parser.add_argument(
             "--pipeline-parallel-size",

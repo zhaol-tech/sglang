@@ -233,3 +233,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("helix")
+def create_helix_backend(runner):
+    from sglang.srt.layers.attention.helix_backend import HelixAttnBackend
+
+    return HelixAttnBackend(runner)

@@ -1390,6 +1390,10 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 
+# Helix parallelism: KVP group for All-to-All communication
+_HELIX_KVP: Optional[GroupCoordinator] = None
+_HELIX_KVP_SIZE: int = 1
+
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
@@ -1423,6 +1427,26 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_helix_kvp_group() -> GroupCoordinator:
+    assert _HELIX_KVP is not None, "helix KVP group is not initialized"
+    return _HELIX_KVP
+
+
+def get_helix_kvp_size() -> int:
+    return _HELIX_KVP_SIZE
+
+
+def is_helix_enabled() -> bool:
+    return _HELIX_KVP_SIZE > 1
+
+
+def get_helix_tpa_size() -> int:
+    """Get the attention-phase TP size (TPA = TP / KVP)."""
+    if not is_helix_enabled():
+        return get_tp_group().world_size
+    return get_tp_group().world_size // _HELIX_KVP_SIZE
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -1588,6 +1612,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    helix_kvp_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
@@ -1854,6 +1879,37 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
     )
+
+    # Build the Helix KVP groups.
+    # KVP group: GPUs with the same tpa_rank (different kvp_rank).
+    # These GPUs hold different KV cache shards for the same query heads
+    # and need to exchange partial attention results via All-to-All.
+    global _HELIX_KVP, _HELIX_KVP_SIZE
+    assert _HELIX_KVP is None, "helix KVP group is already initialized"
+    _HELIX_KVP_SIZE = helix_kvp_size
+    if helix_kvp_size > 1:
+        tpa_size = tensor_model_parallel_size // helix_kvp_size
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            base = tp_group_idx * tensor_model_parallel_size
+            for tpa_idx in range(tpa_size):
+                # GPUs with same tpa_rank: base + tpa_idx, base + tpa_size + tpa_idx, ...
+                ranks = [
+                    base + kvp_idx * tpa_size + tpa_idx
+                    for kvp_idx in range(helix_kvp_size)
+                ]
+                group_ranks.append(ranks)
+        _HELIX_KVP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="helix_kvp",
+        )
+        logger.info(
+            f"Helix KVP groups initialized: kvp_size={helix_kvp_size}, "
+            f"tpa_size={tpa_size}, groups={group_ranks}"
+        )
 
 
 def create_custom_parallel_group(
