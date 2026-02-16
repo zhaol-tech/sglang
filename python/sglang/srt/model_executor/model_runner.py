@@ -800,6 +800,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
+            # Pass helix_kvp_size so that initialize_model_parallel creates
+            # the KVP process groups needed for Helix All-to-All communication.
+            # When helix_kvp_size=1 (default), no KVP groups are created and
+            # attention behaves identically to standard TP.
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 attention_data_parallel_size=self.dp_size,

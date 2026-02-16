@@ -1390,7 +1390,11 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 
-# Helix parallelism: KVP group for All-to-All communication
+# Helix parallelism: KVP group for All-to-All communication.
+# _HELIX_KVP holds the GroupCoordinator for GPUs that share the same TPA rank
+# (i.e., handle the same query-head slice) but hold different KV cache shards.
+# These GPUs exchange partial attention results via All-to-All after local attention.
+# _HELIX_KVP_SIZE tracks the number of KV-sequence shards (1 = disabled).
 _HELIX_KVP: Optional[GroupCoordinator] = None
 _HELIX_KVP_SIZE: int = 1
 
@@ -1430,20 +1434,28 @@ def get_attn_cp_group() -> GroupCoordinator:
 
 
 def get_helix_kvp_group() -> GroupCoordinator:
+    """Return the KVP group coordinator used for All-to-All in Helix attention."""
     assert _HELIX_KVP is not None, "helix KVP group is not initialized"
     return _HELIX_KVP
 
 
 def get_helix_kvp_size() -> int:
+    """Return the number of KV-sequence shards (1 means Helix is disabled)."""
     return _HELIX_KVP_SIZE
 
 
 def is_helix_enabled() -> bool:
+    """Check whether Helix KV parallelism is active."""
     return _HELIX_KVP_SIZE > 1
 
 
 def get_helix_tpa_size() -> int:
-    """Get the attention-phase TP size (TPA = TP / KVP)."""
+    """Return the attention-phase TP size (TPA = TP / KVP).
+
+    In standard TP (no Helix), TPA equals the full TP world size.
+    With Helix, TPA is reduced because some of the N GPUs are used for
+    KVP sharding instead of head-dimension sharding.
+    """
     if not is_helix_enabled():
         return get_tp_group().world_size
     return get_tp_group().world_size // _HELIX_KVP_SIZE
@@ -1880,10 +1892,22 @@ def initialize_model_parallel(
         group_name="pp",
     )
 
-    # Build the Helix KVP groups.
-    # KVP group: GPUs with the same tpa_rank (different kvp_rank).
-    # These GPUs hold different KV cache shards for the same query heads
-    # and need to exchange partial attention results via All-to-All.
+    # Build the Helix KVP groups for All-to-All communication during attention.
+    #
+    # Each GPU is logically mapped to a 2D coordinate (kvp_rank, tpa_rank) where:
+    #   flat_gpu_index = kvp_rank * tpa_size + tpa_rank
+    #
+    # The KVP group for a given tpa_rank contains all GPUs that share that
+    # tpa_rank but have different kvp_ranks. These GPUs hold different
+    # sequence-dimension shards of the KV cache for the same query-head slice,
+    # and need to exchange partial attention outputs + LSE values via All-to-All
+    # so each GPU can reconstruct the exact attention for its final head assignment.
+    #
+    # Example with N=4, KVP=2, TPA=2:
+    #   GPU0=(kvp=0,tpa=0)  GPU1=(kvp=0,tpa=1)  GPU2=(kvp=1,tpa=0)  GPU3=(kvp=1,tpa=1)
+    #   KVP groups: [GPU0, GPU2] (tpa_rank=0), [GPU1, GPU3] (tpa_rank=1)
+    #
+    # The existing _TP group (all N GPUs) is reused for FFN All-Reduce — unchanged.
     global _HELIX_KVP, _HELIX_KVP_SIZE
     assert _HELIX_KVP is None, "helix KVP group is already initialized"
     _HELIX_KVP_SIZE = helix_kvp_size
@@ -1893,12 +1917,14 @@ def initialize_model_parallel(
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             base = tp_group_idx * tensor_model_parallel_size
             for tpa_idx in range(tpa_size):
-                # GPUs with same tpa_rank: base + tpa_idx, base + tpa_size + tpa_idx, ...
+                # Collect all GPUs with this tpa_rank across KVP shards:
+                # rank = base + kvp_idx * tpa_size + tpa_idx
                 ranks = [
                     base + kvp_idx * tpa_size + tpa_idx
                     for kvp_idx in range(helix_kvp_size)
                 ]
                 group_ranks.append(ranks)
+        # KVP groups don't need custom allreduce — they use all_to_all, not allreduce.
         _HELIX_KVP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,

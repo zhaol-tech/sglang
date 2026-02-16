@@ -46,6 +46,8 @@ class HelixAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.forward_metadata = None
 
+        # Import here to avoid circular imports — parallel_state is initialized
+        # before attention backends are constructed.
         from sglang.srt.distributed.parallel_state import (
             get_helix_kvp_group,
             get_helix_kvp_size,
@@ -55,6 +57,8 @@ class HelixAttnBackend(AttentionBackend):
         self.helix_enabled = is_helix_enabled()
         self.kvp_size = get_helix_kvp_size()
         if self.helix_enabled:
+            # .device_group is the underlying torch.distributed ProcessGroup
+            # used by dist.all_to_all in helix_all_to_all_exchange().
             self.kvp_group = get_helix_kvp_group().device_group
         else:
             self.kvp_group = None
@@ -95,20 +99,25 @@ class HelixAttnBackend(AttentionBackend):
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
 
+        # Step 1: Save new KV to local cache (same as every other backend).
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         num_tokens = q.shape[0]
         q_3d = q.view(num_tokens, layer.tp_q_head_num, layer.qk_head_dim)
 
-        # Get KV cache buffers
+        # Retrieve the KV cache pool for this layer. In standard TP, this contains
+        # the full sequence. In Helix (future), it would contain only S/KVP tokens.
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
 
-        # Compute attention per request with LSE
+        # Step 2: Compute local attention per request WITH LSE values.
+        # Unlike standard backends that use FlashInfer/triton (which don't expose LSE),
+        # we use attention_with_lse() which explicitly computes both the output and LSE.
+        # The LSE values are essential for the Helix combining step.
         all_outputs = []
         all_lse = []
 
@@ -116,6 +125,7 @@ class HelixAttnBackend(AttentionBackend):
             seq_len_kv = seq_lens[seq_idx]
             per_req_query = q_3d[seq_idx : seq_idx + 1]  # (1, heads, head_dim)
 
+            # Gather this request's KV from the paged cache
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
             per_req_key = k_cache[per_req_tokens]  # (seq_kv, kv_heads, head_dim)
@@ -125,11 +135,12 @@ class HelixAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
-            # Reshape to (1, heads, seq, dim) for attention
+            # Reshape to (batch=1, heads, seq, dim) for attention_with_lse
             q_4d = per_req_query.unsqueeze(0).transpose(1, 2)  # (1, heads, 1, dim)
             k_4d = per_req_key.unsqueeze(0).transpose(1, 2)  # (1, kv_heads, seq, dim)
             v_4d = per_req_value.unsqueeze(0).transpose(1, 2)
 
+            # causal=False for decode: the single new token attends to all past tokens.
             out, lse = attention_with_lse(
                 q_4d, k_4d, v_4d, scale=layer.scaling, causal=False
             )
@@ -140,17 +151,22 @@ class HelixAttnBackend(AttentionBackend):
         if len(all_outputs) == 0:
             return o
 
-        # Stack: (batch, heads, v_dim) and (batch, heads)
+        # Stack across the batch: (batch, heads, v_dim) and (batch, heads)
         batch_output = torch.stack(all_outputs, dim=0)
         batch_lse = torch.stack(all_lse, dim=0)
 
-        # Apply Helix combining if enabled
+        # Step 3: Helix combining — this is the key difference from standard TP.
+        # In standard TP, attention is already complete (each GPU has full KV for its heads).
+        # In Helix, each GPU only has a partial result (from its KV shard), so we must:
+        #   (a) All-to-All exchange partial outputs across KVP ranks
+        #   (b) Combine using logsumexp rescaling to get the exact result
+        # After this, each GPU has exact attention for H_q/N heads (fewer than it started with).
         if self.helix_enabled and self.kvp_size > 1:
             batch_output = helix_attention_with_kvp(
                 batch_output, batch_lse, self.kvp_group, self.kvp_size
             )
 
-        # Flatten back to (num_tokens, heads * v_dim)
+        # Flatten to (num_tokens, heads * v_dim) — the shape sglang expects from all backends.
         o = batch_output.reshape(num_tokens, -1)
         return o
 
@@ -171,6 +187,7 @@ class HelixAttnBackend(AttentionBackend):
         locally (since all tokens are available during prefill) and only
         distribute the KV cache storage.
         """
+        # Allocate output tensor — same shape handling as forward_decode.
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -180,6 +197,8 @@ class HelixAttnBackend(AttentionBackend):
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
 
+        # Save KV to the local cache shard. In Helix, each GPU only stores
+        # its S/KVP portion of the KV cache (managed by the memory pool).
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
@@ -187,6 +206,7 @@ class HelixAttnBackend(AttentionBackend):
         q_3d = q.view(num_tokens, layer.tp_q_head_num, layer.qk_head_dim)
         o_3d = o.view(num_tokens, layer.tp_q_head_num, layer.v_head_dim)
 
+        # Retrieve KV cache and request mapping — same as forward_decode.
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         req_to_token = forward_batch.req_to_token_pool.req_to_token
@@ -195,6 +215,8 @@ class HelixAttnBackend(AttentionBackend):
         extend_prefix_lens = forward_batch.extend_prefix_lens
         extend_seq_lens = forward_batch.extend_seq_lens
 
+        # Process each request in the batch. Unlike decode (1 token per request),
+        # prefill has extend_seq_len tokens per request, packed contiguously in q.
         start_q = 0
         for seq_idx in range(seq_lens.shape[0]):
             extend_seq_len = extend_seq_lens[seq_idx]
@@ -204,6 +226,7 @@ class HelixAttnBackend(AttentionBackend):
 
             per_req_query = q_3d[start_q:end_q]  # (ext_len, heads, dim)
 
+            # Gather this request's KV from paged cache.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
             per_req_key = k_cache[per_req_tokens]
@@ -213,15 +236,18 @@ class HelixAttnBackend(AttentionBackend):
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
-            # (1, heads, ext_len, dim) format
+            # Reshape to (1, heads, seq, dim) format for attention_with_lse.
             q_4d = per_req_query.unsqueeze(0).transpose(1, 2)
             k_4d = per_req_key.unsqueeze(0).transpose(1, 2)
             v_4d = per_req_value.unsqueeze(0).transpose(1, 2)
 
+            # Prefill uses causal=True so each token only attends to itself
+            # and earlier tokens. We discard the LSE (not needed for prefill —
+            # no Helix combining during prefill since all tokens are local).
             out, _ = attention_with_lse(
                 q_4d, k_4d, v_4d, scale=layer.scaling, causal=True
             )
-            # out: (1, heads, ext_len, v_dim)
+            # out: (1, heads, ext_len, v_dim) → transpose to (ext_len, heads, v_dim)
             o_3d[start_q:end_q] = out.squeeze(0).transpose(0, 1)
 
             start_q = end_q

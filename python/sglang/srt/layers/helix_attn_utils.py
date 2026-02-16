@@ -1,9 +1,22 @@
 """
 Helix Parallelism: Core attention algorithms for KV-parallel decoding.
 
-Implements the logsumexp-based combining of partial attention outputs from
-different KV cache shards, and the All-to-All communication pattern for
-redistributing results across GPUs.
+This module is intentionally free of sglang-internal imports so it can be
+unit-tested on CPU without pulling in triton/flashinfer/CUDA dependencies.
+
+It provides three layers of abstraction:
+
+1. attention_with_lse()  — drop-in replacement for scaled_dot_product_attention
+   that also returns the log-sum-exp (LSE) values needed for combining.
+   (Production would use FlashAttention/FlashInfer kernels that return LSE natively.)
+
+2. helix_combine_partial_attention()  — the mathematical core: given partial
+   attention outputs and LSE values from K different KV shards, combine them
+   into the exact full-attention result using numerically stable logsumexp rescaling.
+
+3. helix_all_to_all_exchange() / helix_attention_with_kvp()  — distributed
+   communication: redistributes partial results across GPUs in the KVP group,
+   then calls the combining step.
 
 Reference: "Helix Parallelism: Rethinking Sharding Strategies for
 Interactive Multi-Million-Token LLM Decoding" (arXiv:2507.07120)
@@ -173,15 +186,19 @@ def helix_all_to_all_exchange(
     )
     num_heads_per_gpu = num_heads_tpa // kvp_size
 
-    # Split local output into KVP chunks along head dimension
-    # Each chunk: (batch, num_heads_per_gpu, head_dim)
+    # Split local output into KVP chunks along the head dimension.
+    # This GPU has H_q/TPA heads; we split into KVP chunks of H_q/N heads each.
+    # Chunk k will be sent to KVP rank k, which owns those heads in the final layout.
     output_chunks = local_output.chunk(kvp_size, dim=1)
     lse_chunks = local_lse.chunk(kvp_size, dim=1)
 
-    # Prepare send/recv buffers
+    # contiguous() is required because chunk() may return views with non-contiguous
+    # strides, and NCCL/gloo all_to_all requires contiguous tensors.
     send_outputs = [chunk.contiguous() for chunk in output_chunks]
     send_lse = [chunk.contiguous() for chunk in lse_chunks]
 
+    # Pre-allocate receive buffers — after the all_to_all, recv_outputs[k] will
+    # contain the partial attention from KVP rank k for THIS GPU's head slice.
     recv_outputs = [
         torch.empty_like(send_outputs[0]) for _ in range(kvp_size)
     ]
@@ -189,7 +206,11 @@ def helix_all_to_all_exchange(
         torch.empty_like(send_lse[0]) for _ in range(kvp_size)
     ]
 
-    # All-to-All: each GPU sends chunk[k] to rank k and receives from rank k
+    # All-to-All: each GPU sends chunk[k] to KVP rank k and receives from rank k.
+    # Communication volume per GPU = KVP * B * (H_q/N) * D — independent of seq len S.
+    # This is the key property from the paper: scaling to millions of tokens doesn't
+    # increase inter-GPU communication, only the local FlashAttention compute grows.
+    # We do two all_to_all calls: one for the attention outputs, one for the LSE values.
     dist.all_to_all(recv_outputs, send_outputs, group=kvp_group)
     dist.all_to_all(recv_lse, send_lse, group=kvp_group)
 

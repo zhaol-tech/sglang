@@ -235,6 +235,10 @@ def create_intel_xpu_backend(runner):
     return XPUAttentionBackend(runner)
 
 
+# Helix attention backend: wraps local attention with KV-parallel combining.
+# Selected via --attention-backend helix. When helix_kvp_size > 1, each GPU
+# computes attention over its local KV shard, then results are combined via
+# All-to-All + logsumexp rescaling to produce exact attention output.
 @register_attention_backend("helix")
 def create_helix_backend(runner):
     from sglang.srt.layers.attention.helix_backend import HelixAttnBackend

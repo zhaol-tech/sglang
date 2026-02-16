@@ -420,7 +420,13 @@ class ServerArgs:
     attn_cp_size: int = 1
     moe_dp_size: int = 1
 
-    # Helix parallelism (KV parallelism for long-context decoding)
+    # Helix parallelism (KV parallelism for long-context decoding).
+    # Controls how many ways the KV cache is sharded along the sequence dimension.
+    # When kvp_size=1 (default), standard TP is used. When kvp_size>1, the N GPUs
+    # are logically arranged as KVP x TPA for attention (where TPA = tp_size / kvp_size),
+    # then reused as TPF=N for FFN. This reduces per-GPU KV cache reads from S to S/KVP
+    # tokens, enabling interactive decoding at multi-million-token contexts.
+    # See docs/helix_parallelism.md for full design details.
     helix_kvp_size: int = 1
 
     # Multi-node distributed serving
@@ -2081,7 +2087,18 @@ class ServerArgs:
                 ), "ep_size * moe_dp_size must be equal to tp_size"
 
     def _handle_helix_parallelism(self):
+        """Validate Helix KV parallelism configuration.
+
+        Helix requires N = KVP x TPA for the attention phase:
+        - KVP (helix_kvp_size): number of sequence-dimension shards of the KV cache
+        - TPA (tp_size / kvp_size): attention-phase tensor parallelism (must be <= num_kv_heads)
+        The FFN phase reuses all N GPUs with standard TP (TPF = tp_size).
+
+        Helix is incompatible with pipeline parallelism (PP) and context parallelism (CP)
+        because both also partition along the sequence or pipeline dimension.
+        """
         if self.helix_kvp_size > 1:
+            # KVP must evenly divide tp_size so that TPA = tp_size / KVP is an integer.
             assert (
                 self.tp_size % self.helix_kvp_size == 0
             ), f"tp_size ({self.tp_size}) must be divisible by helix_kvp_size ({self.helix_kvp_size})"
@@ -2089,7 +2106,9 @@ class ServerArgs:
             assert helix_tpa_size >= 1, (
                 f"helix TPA size (tp_size/kvp_size = {helix_tpa_size}) must be >= 1"
             )
+            # Helix replaces how layers are pipelined; PP conflicts with this.
             assert self.pp_size == 1, "PP is not supported with Helix parallelism"
+            # Context parallelism also shards along sequence; using both is undefined.
             assert self.attn_cp_size == 1, (
                 "Context parallelism (attn_cp_size) is not supported with Helix parallelism"
             )
@@ -3311,6 +3330,8 @@ class ServerArgs:
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
         )
+        # Helix parallelism CLI argument: controls the KV cache sequence-dimension
+        # sharding factor. Placed alongside other parallelism args (tp, cp, dp).
         parser.add_argument(
             "--helix-kvp-size",
             type=int,
